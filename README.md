@@ -1,4 +1,4 @@
-CloudFormation templates for setting up an Amazon ECS cluster.
+CloudFormation templates for setting up an Amazon ECS cluster & services.
 
 ## Prerequisites
 
@@ -9,6 +9,8 @@ aws ecs put-account-setting-default --name serviceLongArnFormat --value enabled
 aws ecs put-account-setting-default --name taskLongArnFormat --value enabled
 aws ecs put-account-setting-default --name containerInstanceLongArnFormat --value enabled
 ```
+
+You'll also need to setup the VPC & Subnet stacks from [sjakthol/aws-account-infra](https://github.com/sjakthol/aws-account-infra).
 
 ## Deployment
 
@@ -47,3 +49,14 @@ This setup includes a hardened container instance role that limits ECS API calls
 * `ecs:SubmitTaskStateChange` -  If not limited, a rogue container instance can mess up the state of tasks in the ECS control plane. This is difficult to abuse as the API requires the attacker to specify unguessable identifiers (container UUIDs, task UUIDs).
 
 [*] **Note on the ECS Task Role Credentials**: The ECS Control Plane exposes a [task metadata endpoint](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint.html) on a link-local address of the container instances. When a task with a task role is scheduled to an instance, the control plane exposes the IAM credentials for the task role via the task metadata endpoint. It also provides the ECS Agent an URL path where the credentials can be read from. The URL path includes a random UUID that cannot be guessed. The agent passes this URL path to containers in the environment which the AWS SDK uses to fetch the credentials. If an attacker can intercept the URL path where the role credentials can be obtained from, the attacker can use it to fetch credentials for the IAM role as well.
+
+## Credits
+The following sources have been used to construct these templates:
+* https://github.com/awslabs/aws-cloudformation-templates/tree/master/aws/services/ECS
+* https://ig.nore.me/2018/02/autoscaling-ecs-containers-using-cloudformation/
+* AWS CloudFormation Resource Reference
+* Amazon ECS Documentation
+
+## License
+
+MIT
