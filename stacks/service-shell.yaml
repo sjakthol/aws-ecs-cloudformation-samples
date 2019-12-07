@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Sample task definition and service that runs a sleeping container
+Parameters:
+  ClusterStackName:
+    Type: String
+    Description: Name for the ECS Cluster stack (used to separate multiple setups)
+
+Resources:
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      RoleName: !Sub ${AWS::StackName}-task-role
+      Path: /
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-task-definition
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ecs-${ClusterStackName}-TaskExecutionRoleArn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-task-definition' }
+      ContainerDefinitions:
+        - Name: shell
+          Image: amazonlinux:2
+          Command: [sleep, inf]
+          Cpu: 1024
+          Memory: 256
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: shell
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${AWS::StackName}-service
+      Cluster:
+        Fn::ImportValue: !Sub ecs-${ClusterStackName}-ClusterId
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: 1
+      TaskDefinition: !Ref TaskDefinition
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-service' }
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+      LogGroupName: !Sub ${AWS::StackName}
