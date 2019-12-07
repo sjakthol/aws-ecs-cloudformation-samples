@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Amazon ECS Cluster with EC2 Auto Scaling Group capacity
+
+Parameters:
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+
+  ClusterStackName:
+    Type: String
+    Description: Name for the ECS Cluster stack (used to separate multiple setups)
+
+Resources:
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}' }
+
+  ContainerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ec2.amazonaws.com
+          Action: 'sts:AssumeRole'
+      Description: !Sub Amazon ECS Container Instance Role for ${Cluster}
+      RoleName: !Sub ${AWS::StackName}-container-instance-role
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+      - PolicyName: AgentManagementPolicy
+        PolicyDocument:
+          Statement:
+          - Sid: AllowGlobalActions
+            Effect: Allow
+            Action:
+              - ecs:DiscoverPollEndpoint
+            Resource: '*'
+
+          - Sid: AllowClusterScopedActions
+            Effect: Allow
+            Action:
+              - ecs:DeregisterContainerInstance
+              - ecs:RegisterContainerInstance
+              - ecs:Submit*
+            Resource:
+              - !GetAtt Cluster.Arn
+
+          - Sid: AllowContainerInstanceScopedActions
+            Effect: Allow
+            Action:
+              - ecs:Poll
+              - ecs:StartTelemetrySession
+            Resource:
+              - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:container-instance/${Cluster}/*
+
+  ContainerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${AWS::StackName}-container-instance-profile
+      Path: /
+      Roles:
+        - !Ref ContainerInstanceRole
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      Description: !Sub Amazon ECS Task Execution Role for ${Cluster}
+      RoleName: !Sub ${AWS::StackName}-task-execution-role
+      Path: /
+
+  AgentExecutionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AgentExecutionPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowImagePulls
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Resource: '*'
+
+          - Sid: AllowLogging
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+      Roles:
+        - !Ref ContainerInstanceRole
+        - !Ref TaskExecutionRole
+
+  ContainerInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-sg
+      GroupDescription: !Sub Security group for ${Cluster} container instances
+      VpcId: !ImportValue infra-vpc-VpcId
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-sg' }
+
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-template
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt ContainerInstanceProfile.Arn
+        ImageId: !Ref AmiId
+        SecurityGroupIds:
+          - !Ref ContainerInstanceSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub '${AWS::StackName}-node' }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub '${AWS::StackName}-volume' }
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash
+              set -o xtrace
+
+              # Setup SSM for remote management
+              yum install -y amazon-ssm-agent
+              systemctl start amazon-ssm-agent
+
+              # Configure ECS Agent
+              echo ECS_CLUSTER=${Cluster} >> /etc/ecs/ecs.config
+
+              # Block container access to EC2 Instance Metadata
+              yum install -y iptables-services
+              iptables --insert FORWARD 1 --in-interface docker+ --destination 169.254.169.254/32 --jump DROP
+              iptables-save | tee /etc/sysconfig/iptables
+              systemctl enable --now iptables
+
+              # Signal success to CloudFormation
+              yum install -y aws-cfn-bootstrap
+              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ECSAutoScalingGroup --region ${AWS::Region}
+
+  ECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: True
+    Properties:
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandPercentageAboveBaseCapacity: 0
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref NodeLaunchTemplate
+            Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+          Overrides:
+            - InstanceType: m5.large
+            - InstanceType: c5.large
+      DesiredCapacity: '1'
+      MinSize: '0'
+      MaxSize: '10'
+      VPCZoneIdentifier:
+        - Fn::ImportValue: infra-vpc-sn-public-a
+        - Fn::ImportValue: infra-vpc-sn-public-b
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-asg', PropagateAtLaunch: false }
+
+Outputs:
+  TaskExecutionRoleArn:
+    Description: ARN of the ECS Task Execution Role (for Fargate)
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export:
+      Name: !Sub ecs-${ClusterStackName}-TaskExecutionRoleArn
+
+  ClusterId:
+    Description: The name / id of the ECS cluster
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub ecs-${ClusterStackName}-ClusterId
+
+  ContainerInstanceSecurityGroupId:
+    Description: Security group ID of the ECS cluster container instances
+    Value: !Ref ContainerInstanceSecurityGroup
+    Export:
+      Name: !Sub ecs-${ClusterStackName}-SecurityGroupId
